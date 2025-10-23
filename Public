@@ -1,0 +1,50 @@
+<!doctype html>
+<html>
+<head>
+  <meta charset="utf-8" />
+  <title>Valor Online MOBA (Demo)</title>
+  <meta name="viewport" content="width=device-width,initial-scale=1" />
+  <link rel="stylesheet" href="./style.css" />
+</head>
+<body>
+  <div id="ui">
+    <h2>Valor Online MOBA — Demo</h2>
+
+    <div class="row">
+      <input id="username" placeholder="Your username" />
+      <button id="btnRegister">Register & Join Lobby</button>
+    </div>
+
+    <div class="row">
+      <label>Hero:</label>
+      <select id="hero">
+        <option>Vanguard</option>
+        <option>Phantom</option>
+        <option>Ember</option>
+      </select>
+      <button id="btnSetHero">Set Hero</button>
+    </div>
+
+    <div class="row">
+      <input id="friendName" placeholder="Friend username to invite" />
+      <button id="btnInvite">Invite Friend (to voice/match)</button>
+    </div>
+
+    <div class="row">
+      <button id="btnTopup">Top-up +100 (Demo)</button>
+      <span>Balance: <span id="balance">100</span></span>
+    </div>
+
+    <div id="lobby">Lobby: —</div>
+    <div id="messages"></div>
+  </div>
+
+  <div id="game">
+    <canvas id="arenaCanvas"></canvas>
+    <div id="minimap">Mini-map</div>
+  </div>
+
+  <script src="/socket.io/socket.io.js"></script>
+  <script src="./client.js"></script>
+</body>
+</html>
