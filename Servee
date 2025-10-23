@@ -1,0 +1,175 @@
+// server.js
+import express from 'express';
+import http from 'http';
+import { Server } from 'socket.io';
+import Database from 'better-sqlite3';
+import path from 'path';
+import { fileURLToPath } from 'url';
+import crypto from 'crypto';
+
+const __dirname = path.dirname(fileURLToPath(import.meta.url));
+const app = express();
+const server = http.createServer(app);
+const io = new Server(server, { cors: { origin: "*" } });
+
+app.use(express.json());
+app.use(express.static(path.join(__dirname, 'public')));
+
+// --- Simple DB (better-sqlite3) ---
+const db = new Database(path.join(__dirname, 'data.sqlite'));
+db.exec(`
+CREATE TABLE IF NOT EXISTS users (
+  username TEXT PRIMARY KEY,
+  display TEXT,
+  balance INTEGER DEFAULT 100
+);
+CREATE TABLE IF NOT EXISTS friends (
+  id TEXT PRIMARY KEY,
+  requester TEXT,
+  receiver TEXT,
+  status TEXT DEFAULT 'pending',
+  created_at DATETIME DEFAULT CURRENT_TIMESTAMP
+);
+`);
+
+// --- helpers ---
+const LOBBY_ID = 'main';
+const CONFIG = { TEAM_SIZE: 10, WAIT_FILL_SEC: 120 }; // 5v5 total 10
+const lobbies = new Map(); // lobbyId -> { players: Map(socketId->{username,hero}), bots: Map(botId->{}), lastJoin, fillTimer }
+function createLobby(id = LOBBY_ID) {
+  if (!lobbies.has(id)) lobbies.set(id, { players: new Map(), bots: new Map(), match:false, lastJoin: Date.now(), fillTimer:null });
+  return lobbies.get(id);
+}
+
+function broadcastLobby(lid) {
+  const l = lobbies.get(lid);
+  if (!l) return;
+  const list = [];
+  for (const [sid, p] of l.players.entries()) list.push({ id: sid, username: p.username, hero: p.hero });
+  for (const bname of l.bots.keys()) list.push({ id: bname, username: bname, hero: 'BOT' });
+  io.to(lid).emit('lobbyUpdate', { players: list, count: list.length });
+}
+
+function scheduleFill(lid) {
+  const l = lobbies.get(lid);
+  if (!l) return;
+  if (l.fillTimer) clearTimeout(l.fillTimer);
+  const delay = Math.max(0, l.lastJoin + CONFIG.WAIT_FILL_SEC*1000 - Date.now());
+  l.fillTimer = setTimeout(()=> fillWithBots(lid), delay);
+  io.to(lid).emit('matchCountdown', { waitSec: CONFIG.WAIT_FILL_SEC });
+}
+
+function fillWithBots(lid) {
+  const l = lobbies.get(lid);
+  if (!l || l.match) return;
+  const human = l.players.size;
+  const total = human + l.bots.size;
+  const need = Math.max(0, CONFIG.TEAM_SIZE - total);
+  for (let i=0;i<need;i++){
+    const botId = `AI-${crypto.randomBytes(3).toString('hex')}`;
+    l.bots.set(botId, { id: botId, hero:'BOT', lane: i%3 });
+  }
+  io.to(lid).emit('info', { msg: `${need} bot(s) added to fill match.` });
+  broadcastLobby(lid);
+  startMatch(lid);
+}
+
+function startMatch(lid) {
+  const l = lobbies.get(lid);
+  if (!l || l.match) return;
+  l.match = true;
+  l.startedAt = Date.now();
+  io.to(lid).emit('matchStarted', { startedAt: l.startedAt });
+  // (Optional) spawn minion waves, bot telemetry — omitted for brevity
+}
+
+// --- HTTP endpoints for register/login/topup/friends (simple) ---
+app.post('/api/register', (req, res) => {
+  const { username, display } = req.body;
+  if (!username) return res.status(400).json({ error: 'username required' });
+  const exists = db.prepare('SELECT username FROM users WHERE username=?').get(username);
+  if (exists) return res.status(400).json({ error: 'username exists' });
+  db.prepare('INSERT INTO users(username, display) VALUES(?,?)').run(username, display||username);
+  return res.json({ ok:true, username });
+});
+
+app.post('/api/topup', (req, res) => {
+  const { username, amount } = req.body;
+  if (!username || !amount) return res.status(400).json({ error: 'bad' });
+  const row = db.prepare('SELECT balance FROM users WHERE username=?').get(username);
+  const prev = row ? row.balance : 0;
+  const newb = prev + Number(amount);
+  db.prepare('UPDATE users SET balance=? WHERE username=?').run(newb, username);
+  return res.json({ ok:true, balance: newb });
+});
+
+app.post('/api/friend/request', (req, res) => {
+  const { requester, receiver } = req.body;
+  if (!requester || !receiver) return res.status(400).json({ error:'bad' });
+  const id = crypto.randomBytes(8).toString('hex');
+  db.prepare('INSERT INTO friends(id, requester, receiver) VALUES(?,?,?)').run(id, requester, receiver);
+  // notify online receiver if socket present
+  for (const [idS, s] of io.sockets.sockets) {
+    if (s.data && s.data.username === receiver) s.emit('friendRequest', { requester, id });
+  }
+  return res.json({ ok:true });
+});
+
+// --- Socket.IO handlers (matchmaking, friend invites, WebRTC signaling) ---
+io.on('connection', socket => {
+  socket.on('registerSocket', ({ username }) => {
+    socket.data.username = username;
+    // auto join main lobby for convenience
+    socket.join(LOBBY_ID);
+    const l = createLobby(LOBBY_ID);
+    l.players.set(socket.id, { username, hero:'Vanguard' });
+    l.lastJoin = Date.now();
+    broadcastLobby(LOBBY_ID);
+    scheduleFill(LOBBY_ID);
+  });
+
+  socket.on('updateHero', ({ hero }) => {
+    const l = createLobby(LOBBY_ID);
+    const p = l.players.get(socket.id);
+    if (p) { p.hero = hero; broadcastLobby(LOBBY_ID); }
+  });
+
+  socket.on('leaveLobby', () => {
+    const l = createLobby(LOBBY_ID);
+    l.players.delete(socket.id);
+    broadcastLobby(LOBBY_ID);
+    socket.leave(LOBBY_ID);
+  });
+
+  // friend invite via socket (real-time)
+  socket.on('inviteFriend', ({ toUsername, roomId }) => {
+    for (const [sId, s] of io.sockets.sockets) {
+      if (s.data && s.data.username === toUsername) {
+        s.emit('friendInvite', { from: socket.data.username || 'anon', roomId });
+      }
+    }
+  });
+
+  // WebRTC Signaling messages
+  socket.on('webrtc-offer', ({ to, offer }) => {
+    for (const [sId, s] of io.sockets.sockets) if (s.data && s.data.username === to) s.emit('webrtc-offer', { from: socket.data.username, offer });
+  });
+  socket.on('webrtc-answer', ({ to, answer }) => {
+    for (const [sId, s] of io.sockets.sockets) if (s.data && s.data.username === to) s.emit('webrtc-answer', { from: socket.data.username, answer });
+  });
+  socket.on('webrtc-ice', ({ to, candidate }) => {
+    for (const [sId, s] of io.sockets.sockets) if (s.data && s.data.username === to) s.emit('webrtc-ice', { from: socket.data.username, candidate });
+  });
+
+  socket.on('disconnect', () => {
+    const l = createLobby(LOBBY_ID);
+    l.players.delete(socket.id);
+    broadcastLobby(LOBBY_ID);
+  });
+});
+
+// Serve client
+app.get('/', (req, res) => res.sendFile(path.join(__dirname, 'public', 'index.html')));
+
+const PORT = process.env.PORT || 3000;
+server.listen(PORT, ()=> console.log(`Server running on ${PORT}`));
